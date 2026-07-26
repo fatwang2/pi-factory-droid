@@ -51,6 +51,25 @@ let activeKeyHash: string | undefined;
 let lastSpawnAt: number | undefined;
 let lastError: string | undefined;
 let uiRef: ExtensionUIContext | null = null;
+// Droid reports session-cumulative token counters. Pi treats each assistant
+// message usage as a single request and uses it for context % / auto-compact.
+// Track baselines + last-call/context stats so we can report per-turn numbers.
+let usageBaseline: TokenBuckets = emptyBuckets();
+let latestCumulative: TokenBuckets | null = null;
+let lastCallUsage: TokenBuckets | null = null;
+let contextStatsUsed: number | undefined;
+let unsubscribeUsageNotifications: (() => void) | undefined;
+
+interface TokenBuckets {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+function emptyBuckets(): TokenBuckets {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
 
 export function setRuntimeContext(ui: ExtensionUIContext | null, cwd?: string): void {
   uiRef = ui;
@@ -87,6 +106,7 @@ export async function closeSession(): Promise<void> {
   activeReasoning = undefined;
   activeKeyHash = undefined;
   lastSpawnAt = undefined;
+  resetUsageTracking();
   if (current) {
     try {
       await current.close();
@@ -217,6 +237,7 @@ function streamDroid(
       if (!options?.apiKey) throw new Error("No Factory API key. Run /login droid or set FACTORY_API_KEY.");
       const reasoning = resolveReasoning(model, options.reasoning);
       const droidSession = await getOrCreateSession(cfg, options.apiKey, model.id, reasoning);
+      beginTurnUsageTracking(droidSession);
       stream.push({ type: "start", partial: output });
 
       const turn = extractLatestTurn(context);
@@ -229,6 +250,7 @@ function streamDroid(
       }
 
       if (aborted || options.signal?.aborted) throw new Error("Request was aborted");
+      await finalizeTurnUsage(droidSession, output, model);
       closeOpenBlocks(output, stream, openTextKeys, openThinkingKeys, indexOf);
       stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
       stream.end();
@@ -298,6 +320,7 @@ async function getOrCreateSession(
   activeKeyHash = keyHash;
   lastSpawnAt = Date.now();
   lastError = undefined;
+  attachUsageNotifications(created);
   return created;
 }
 
@@ -456,10 +479,14 @@ function translate(
       return;
     }
     case DroidMessageType.TokenUsageUpdate:
-      updateUsage(output, event, model);
+      // Streamed values are session-cumulative. Convert to per-turn deltas so
+      // Pi footer/context math stays sane mid-turn.
+      applyTurnUsage(output, cumulativeToTurnBuckets(event), model, { preferLastCall: false });
       return;
     case DroidMessageType.Result:
-      if (event.tokenUsage) updateUsage(output, event.tokenUsage, model);
+      if (event.tokenUsage) {
+        applyTurnUsage(output, cumulativeToTurnBuckets(event.tokenUsage), model, { preferLastCall: false });
+      }
       if (event.isError) throw new Error(event.errors?.join("; ") || event.error?.message || "Droid execution failed");
       return;
     case DroidMessageType.Error:
@@ -470,17 +497,150 @@ function translate(
   }
 }
 
-function updateUsage(
+function resetUsageTracking(): void {
+  unsubscribeUsageNotifications?.();
+  unsubscribeUsageNotifications = undefined;
+  usageBaseline = emptyBuckets();
+  latestCumulative = null;
+  lastCallUsage = null;
+  contextStatsUsed = undefined;
+}
+
+function attachUsageNotifications(droidSession: DroidSession): void {
+  unsubscribeUsageNotifications?.();
+  unsubscribeUsageNotifications = droidSession.onNotification((notification) => {
+    if (notification?.type !== "session_token_usage_changed") return;
+    const lastCall = readTokenBuckets(notification.lastCallTokenUsage);
+    if (lastCall) lastCallUsage = lastCall;
+    const cumulative = readTokenBuckets(notification.tokenUsage)
+      ?? readTokenBuckets(notification.inclusiveTokenUsage);
+    if (cumulative) latestCumulative = cumulative;
+  }, { type: "session_token_usage_changed" });
+}
+
+function beginTurnUsageTracking(droidSession: DroidSession): void {
+  lastCallUsage = null;
+  latestCumulative = null;
+  contextStatsUsed = undefined;
+  attachUsageNotifications(droidSession);
+}
+
+async function finalizeTurnUsage(
+  droidSession: DroidSession,
   output: AssistantMessage,
-  usage: { inputTokens?: number; outputTokens?: number; thinkingTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number },
   model: Model<Api>,
+): Promise<void> {
+  // Prefer Droid's compaction-meter last-call numbers when raw notifications expose them.
+  if (lastCallUsage) {
+    applyTurnUsage(output, lastCallUsage, model, { preferLastCall: true });
+  }
+
+  try {
+    const stats = await droidSession.getContextStats();
+    if (typeof stats?.used === "number" && Number.isFinite(stats.used) && stats.used >= 0) {
+      contextStatsUsed = stats.used;
+      // Pi context % uses usage.totalTokens. Override with real window occupancy;
+      // keep input/output/cache as per-turn deltas for ↑/↓/R footer counters.
+      output.usage.totalTokens = Math.round(stats.used);
+      output.usage.cost = calculateCost(model, output.usage);
+    }
+  } catch {
+    // getContextStats is best-effort; delta usage already applied.
+  }
+
+  // Advance baseline from the latest session-cumulative counters when available.
+  if (latestCumulative) {
+    usageBaseline = { ...latestCumulative };
+  } else {
+    usageBaseline = {
+      input: usageBaseline.input + Math.max(0, output.usage.input),
+      output: usageBaseline.output + Math.max(0, output.usage.output),
+      cacheRead: usageBaseline.cacheRead + Math.max(0, output.usage.cacheRead),
+      cacheWrite: usageBaseline.cacheWrite + Math.max(0, output.usage.cacheWrite),
+    };
+  }
+}
+
+function cumulativeToTurnBuckets(
+  usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    thinkingTokens?: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+  },
+): TokenBuckets {
+  const cumulative: TokenBuckets = {
+    input: usage.inputTokens ?? 0,
+    output: (usage.outputTokens ?? 0) + (usage.thinkingTokens ?? 0),
+    cacheRead: usage.cacheReadTokens ?? 0,
+    cacheWrite: usage.cacheCreationTokens ?? 0,
+  };
+  latestCumulative = cumulative;
+  return {
+    input: Math.max(0, cumulative.input - usageBaseline.input),
+    output: Math.max(0, cumulative.output - usageBaseline.output),
+    cacheRead: Math.max(0, cumulative.cacheRead - usageBaseline.cacheRead),
+    cacheWrite: Math.max(0, cumulative.cacheWrite - usageBaseline.cacheWrite),
+  };
+}
+
+function applyTurnUsage(
+  output: AssistantMessage,
+  turn: TokenBuckets,
+  model: Model<Api>,
+  opts: { preferLastCall: boolean },
 ): void {
-  output.usage.input = usage.inputTokens ?? 0;
-  output.usage.output = (usage.outputTokens ?? 0) + (usage.thinkingTokens ?? 0);
-  output.usage.cacheRead = usage.cacheReadTokens ?? 0;
-  output.usage.cacheWrite = usage.cacheCreationTokens ?? 0;
-  output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+  // lastCall is authoritative for prompt/cache size when present; keep the
+  // larger output delta if stream cumulative saw more generation tokens.
+  if (opts.preferLastCall) {
+    output.usage.input = turn.input;
+    output.usage.cacheRead = turn.cacheRead;
+    output.usage.cacheWrite = turn.cacheWrite;
+    output.usage.output = Math.max(output.usage.output, turn.output);
+  } else {
+    output.usage.input = turn.input;
+    output.usage.output = turn.output;
+    output.usage.cacheRead = turn.cacheRead;
+    output.usage.cacheWrite = turn.cacheWrite;
+  }
+
+  // Context occupancy for Pi: prefer exact meter, else prompt-side tokens only.
+  // Do not sum multi-million cumulative cache reads into totalTokens — that was
+  // blowing past contextWindow and forcing auto-compact every turn.
+  if (contextStatsUsed !== undefined) {
+    output.usage.totalTokens = Math.round(contextStatsUsed);
+  } else {
+    const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
+    const contextCap = model.contextWindow > 0 ? model.contextWindow : Number.POSITIVE_INFINITY;
+    output.usage.totalTokens = Math.round(Math.min(promptTokens, contextCap));
+  }
   output.usage.cost = calculateCost(model, output.usage);
+}
+
+function readTokenBuckets(value: unknown): TokenBuckets | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const input = numberOrUndefined(record.inputTokens);
+  const cacheRead = numberOrUndefined(record.cacheReadTokens);
+  if (input === undefined && cacheRead === undefined
+    && numberOrUndefined(record.outputTokens) === undefined
+    && numberOrUndefined(record.thinkingTokens) === undefined
+    && numberOrUndefined(record.cacheCreationTokens) === undefined) {
+    return null;
+  }
+  const outputTokens = numberOrUndefined(record.outputTokens) ?? 0;
+  const thinkingTokens = numberOrUndefined(record.thinkingTokens) ?? 0;
+  return {
+    input: input ?? 0,
+    output: outputTokens + thinkingTokens,
+    cacheRead: cacheRead ?? 0,
+    cacheWrite: numberOrUndefined(record.cacheCreationTokens) ?? 0,
+  };
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function closeOpenBlocks(
@@ -511,4 +671,24 @@ function closeOpenBlocks(
 export const __testUtils = {
   createPermissionHandler,
   isPromptAlwaysEnabled,
+  cumulativeToTurnBuckets,
+  applyTurnUsage,
+  readTokenBuckets,
+  resetUsageTracking,
+  setUsageBaselineForTest(baseline: TokenBuckets): void {
+    usageBaseline = { ...baseline };
+  },
+  getUsageBaselineForTest(): TokenBuckets {
+    return { ...usageBaseline };
+  },
+  setLastCallUsageForTest(usage: TokenBuckets | null): void {
+    lastCallUsage = usage ? { ...usage } : null;
+  },
+  setContextStatsUsedForTest(used: number | undefined): void {
+    contextStatsUsed = used;
+  },
+  advanceBaselineFromCumulativeForTest(cumulative: TokenBuckets): void {
+    latestCumulative = { ...cumulative };
+    usageBaseline = { ...cumulative };
+  },
 };
