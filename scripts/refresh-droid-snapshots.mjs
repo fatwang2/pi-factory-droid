@@ -28,6 +28,37 @@ import {
   ToolConfirmationOutcome,
 } from "@factory/droid-sdk";
 
+// --- Enum value -> enum member name mappings (must be defined before use) ---
+const MODEL_PROVIDER_ENUM = {
+  anthropic: "ModelProvider.ANTHROPIC",
+  openai: "ModelProvider.OPENAI",
+  "generic-chat-completion-api": "ModelProvider.GENERIC_CHAT_COMPLETION_API",
+  factory: "ModelProvider.FACTORY",
+  google: "ModelProvider.GOOGLE",
+  xai: "ModelProvider.XAI",
+  voyage: "ModelProvider.VOYAGE",
+};
+
+const REASONING_EFFORT_ENUM = {
+  none: "ReasoningEffort.None",
+  dynamic: "ReasoningEffort.Dynamic",
+  off: "ReasoningEffort.Off",
+  minimal: "ReasoningEffort.Minimal",
+  low: "ReasoningEffort.Low",
+  medium: "ReasoningEffort.Medium",
+  high: "ReasoningEffort.High",
+  xhigh: "ReasoningEffort.ExtraHigh",
+  max: "ReasoningEffort.Max",
+};
+
+function toModelProviderEnum(value) {
+  return MODEL_PROVIDER_ENUM[value] ?? JSON.stringify(value);
+}
+
+function toReasoningEffortEnum(value) {
+  return REASONING_EFFORT_ENUM[value] ?? JSON.stringify(value);
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = resolve(__dirname, "..");
 const DEFAULT_OUT = join(PKG_ROOT, "src", "catalog.generated.ts");
@@ -127,7 +158,7 @@ function renderSnapshot(models, takenAt) {
 // Source: Factory account discovery via @factory/droid-sdk
 // Regen: \`FACTORY_API_KEY=... npm run refresh:snapshots\`
 
-import type { AvailableModelConfig } from "@factory/droid-sdk";
+import { ModelProvider, ReasoningEffort, type AvailableModelConfig } from "@factory/droid-sdk";
 
 export const SNAPSHOT_TAKEN_AT = ${JSON.stringify(takenAt)};
 export const SNAPSHOT_KEY = ${JSON.stringify(fallbackKeyHash)};
@@ -145,14 +176,14 @@ function formatRow(m) {
   if (m.modelId !== undefined) fields.push(`modelId: ${JSON.stringify(m.modelId)}`);
   fields.push(`displayName: ${JSON.stringify(m.displayName)}`);
   fields.push(`shortDisplayName: ${JSON.stringify(m.shortDisplayName)}`);
-  fields.push(`modelProvider: ${JSON.stringify(m.modelProvider)}`);
+  fields.push(`modelProvider: ${toModelProviderEnum(m.modelProvider)}`);
   fields.push(
     `supportedReasoningEfforts: [${(m.supportedReasoningEfforts ?? [])
-      .map((e) => JSON.stringify(e))
+      .map((e) => toReasoningEffortEnum(e))
       .join(", ")}]`,
   );
-  fields.push(`defaultReasoningEffort: ${JSON.stringify(m.defaultReasoningEffort)}`);
-  if (m.isCustom) fields.push(`isCustom: true`);
+  fields.push(`defaultReasoningEffort: ${toReasoningEffortEnum(m.defaultReasoningEffort)}`);
+  fields.push(`isCustom: ${m.isCustom === true ? "true" : "false"}`);
   if (m.noImageSupport) fields.push(`noImageSupport: true`);
   if (m.supportsPDFs) fields.push(`supportsPDFs: true`);
   if (m.tier) fields.push(`tier: ${JSON.stringify(m.tier)}`);
