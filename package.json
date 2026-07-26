@@ -1,0 +1,38 @@
+{
+  "name": "pi-factory-droid",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Pi Coding Agent provider extension that exposes Factory Droid models via @factory/droid-sdk with account-aware model discovery, autonomy-aware permissions, and fallback snapshots.",
+  "author": "fatwang2",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "factory", "droid", "droid-sdk"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fatwang2/pi-factory-droid.git"
+  },
+  "homepage": "https://github.com/fatwang2/pi-factory-droid#readme",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "check": "npm run typecheck && npm test",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "refresh:snapshots": "node scripts/refresh-droid-snapshots.mjs"
+  },
+  "dependencies": {
+    "@factory/droid-sdk": "^0.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.82.0",
+    "@earendil-works/pi-coding-agent": ">=0.82.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.0"
+  }
+}
