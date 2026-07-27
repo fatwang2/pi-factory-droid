@@ -3,9 +3,15 @@ import { fallbackModels } from "./catalog.js";
 import { registerCommands } from "./commands.js";
 import { CONFIG_PATH_FOR_DIAGNOSTICS, loadConfig } from "./config.js";
 import { registerProvider, setRuntimeContext, wireSessionShutdown } from "./providers.js";
+import { applyPermissionOptionCompat } from "./sdk-compat.js";
 import type { RuntimeState } from "./types.js";
 
 export default function piDroid(pi: ExtensionAPI): void {
+  if (applyPermissionOptionCompat() === "unavailable") {
+    console.warn(
+      "[pi-droid] Could not widen the SDK permission-option schema. MCP tool calls may fail with 'Failed to handle permission request'.",
+    );
+  }
   const cfg = loadConfig();
   const initialModels = fallbackModels(cfg.modelOverrides);
   const state: RuntimeState = {
