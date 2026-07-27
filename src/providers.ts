@@ -537,15 +537,9 @@ async function finalizeTurnUsage(
 
   try {
     const stats = await droidSession.getContextStats();
-    if (typeof stats?.used === "number" && Number.isFinite(stats.used) && stats.used >= 0) {
-      contextStatsUsed = stats.used;
-      // Pi context % uses usage.totalTokens. Override with real window occupancy;
-      // keep input/output/cache as per-turn deltas for ↑/↓/R footer counters.
-      output.usage.totalTokens = Math.round(stats.used);
-      output.usage.cost = calculateCost(model, output.usage);
-    }
+    applyContextStats(output, model, stats);
   } catch {
-    // getContextStats is best-effort; delta usage already applied.
+    // getContextStats is best-effort; delta usage and catalog fallback remain available.
   }
 
   // Advance baseline from the latest session-cumulative counters when available.
@@ -558,6 +552,32 @@ async function finalizeTurnUsage(
       cacheRead: usageBaseline.cacheRead + Math.max(0, output.usage.cacheRead),
       cacheWrite: usageBaseline.cacheWrite + Math.max(0, output.usage.cacheWrite),
     };
+  }
+}
+
+function applyContextStats(
+  output: AssistantMessage,
+  model: Model<Api>,
+  stats: { used?: unknown; limit?: unknown; [key: string]: unknown },
+): void {
+  const limit = positiveNumberOrUndefined(stats.limit);
+  if (limit !== undefined) {
+    // Droid's context meter reports the active model's effective max input,
+    // including reasoning-effort and regional routing adjustments. Pi compares
+    // usage.totalTokens against model.contextWindow for auto-compaction, so the
+    // two values must describe the same budget. Mutating the active model here
+    // prevents Pi's conservative catalog fallback (for example 128k for GLM)
+    // from compacting before Droid's own context manager needs to.
+    model.contextWindow = Math.round(limit);
+  }
+
+  const used = nonNegativeNumberOrUndefined(stats.used);
+  if (used !== undefined) {
+    contextStatsUsed = used;
+    // Pi context % uses usage.totalTokens. Keep input/output/cache as per-turn
+    // deltas for the footer counters while reporting real window occupancy.
+    output.usage.totalTokens = Math.round(used);
+    output.usage.cost = calculateCost(model, output.usage);
   }
 }
 
@@ -643,6 +663,16 @@ function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function nonNegativeNumberOrUndefined(value: unknown): number | undefined {
+  const number = numberOrUndefined(value);
+  return number !== undefined && number >= 0 ? number : undefined;
+}
+
+function positiveNumberOrUndefined(value: unknown): number | undefined {
+  const number = numberOrUndefined(value);
+  return number !== undefined && number > 0 ? number : undefined;
+}
+
 function closeOpenBlocks(
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
@@ -673,6 +703,7 @@ export const __testUtils = {
   isPromptAlwaysEnabled,
   cumulativeToTurnBuckets,
   applyTurnUsage,
+  applyContextStats,
   readTokenBuckets,
   resetUsageTracking,
   setUsageBaselineForTest(baseline: TokenBuckets): void {

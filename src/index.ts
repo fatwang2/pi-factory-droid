@@ -35,8 +35,11 @@ export default function piDroid(pi: ExtensionAPI): void {
   });
 
   pi.on("model_select", async (event, ctx) => {
-    if (event.model.provider !== "droid" || !ctx.hasUI) return;
-    ctx.ui.setStatus("pi-droid", `Droid: ${event.model.id}`);
+    if (!ctx.hasUI) return;
+    ctx.ui.setStatus(
+      "pi-droid",
+      event.model.provider === "droid" ? `Droid: ${event.model.id}` : undefined,
+    );
   });
 
   pi.on("session_shutdown", async () => {

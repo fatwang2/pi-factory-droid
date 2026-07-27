@@ -6,6 +6,7 @@ import { __testUtils } from "../src/providers.js";
 const {
   cumulativeToTurnBuckets,
   applyTurnUsage,
+  applyContextStats,
   readTokenBuckets,
   resetUsageTracking,
   setUsageBaselineForTest,
@@ -104,6 +105,31 @@ test("applyTurnUsage prefers getContextStats used for totalTokens", () => {
   assert.equal(output.usage.totalTokens, 42_000);
   assert.equal(output.usage.input, 10_000);
   assert.equal(output.usage.cacheRead, 30_000);
+});
+
+test("applyContextStats synchronizes Droid's effective context limit into Pi", () => {
+  const output = makeAssistant();
+  const model = makeModel(128_000);
+
+  applyContextStats(output, model, {
+    used: 42_000,
+    remaining: 866_928,
+    limit: 908_928,
+    accuracy: "estimated",
+  });
+
+  assert.equal(model.contextWindow, 908_928);
+  assert.equal(output.usage.totalTokens, 42_000);
+});
+
+test("applyContextStats ignores invalid limits without clobbering catalog metadata", () => {
+  const output = makeAssistant();
+  const model = makeModel(128_000);
+
+  applyContextStats(output, model, { used: -1, limit: 0 });
+
+  assert.equal(model.contextWindow, 128_000);
+  assert.equal(output.usage.totalTokens, 0);
 });
 
 test("preferLastCall keeps larger streamed output delta", () => {
