@@ -87,6 +87,47 @@ export function createInstanceRuntime(): InstanceRuntime {
 }
 
 /**
+ * Per-CALL runtime resolution. Pi keeps ONE process-wide provider registry:
+ * every AgentSession re-registers this provider on load, and streaming resolves
+ * the provider from the registry at request time — so the streamFn that runs
+ * may belong to a DIFFERENT session's extension instance than the caller
+ * (last registration wins; with concurrent sessions it's effectively random).
+ * The instance runtime captured in the closure is therefore untrustworthy.
+ *
+ * Pi does pass the caller's identity per call: stream options carry
+ * `sessionId` (= sessionManager.getSessionId()). Each extension instance
+ * binds its runtime here under that id on session_start, and streamDroid
+ * resolves the CALLER's runtime from this map instead of trusting its closure.
+ */
+const sessionRuntimes = new Map<string, InstanceRuntime>();
+const MAX_SESSION_RUNTIMES = 256;
+
+export function bindSessionRuntime(sessionId: string, runtime: InstanceRuntime): void {
+  // Re-binding the same id replaces the previous instance's runtime — refresh
+  // insertion order so active conversations aren't evicted before idle ones.
+  sessionRuntimes.delete(sessionId);
+  sessionRuntimes.set(sessionId, runtime);
+  while (sessionRuntimes.size > MAX_SESSION_RUNTIMES) {
+    const oldest = sessionRuntimes.keys().next().value;
+    if (oldest === undefined) break;
+    sessionRuntimes.delete(oldest);
+  }
+}
+
+function resolveCallRuntime(
+  options: SimpleStreamOptions | undefined,
+  fallback: InstanceRuntime,
+): InstanceRuntime {
+  const sessionId = (options as { sessionId?: unknown } | undefined)?.sessionId;
+  if (typeof sessionId !== "string" || !sessionId) return fallback;
+  const bound = sessionRuntimes.get(sessionId);
+  if (bound) return bound;
+  // The caller's session never bound (older host, bootstrap session): still
+  // key the pool by the caller's true conversation id so histories don't merge.
+  return { ...fallback, sessionKey: sessionId };
+}
+
+/**
  * One pooled Droid session bound to one Pi conversation. Everything that used
  * to be a module-level singleton (session handle, model settings, usage
  * tracking) lives here so concurrent conversations can't contaminate each
@@ -352,8 +393,12 @@ function streamDroid(
   context: Context,
   options: SimpleStreamOptions | undefined,
   cfg: ResolvedConfig,
-  runtime: InstanceRuntime,
+  instanceRuntime: InstanceRuntime,
 ): AssistantMessageEventStream {
+  // The closure runtime may belong to another session's extension instance
+  // (shared provider registry, last registration wins) — resolve the actual
+  // caller from the per-call session id.
+  const runtime = resolveCallRuntime(options, instanceRuntime);
   const stream = createAssistantMessageEventStream();
 
   void (async () => {
@@ -942,6 +987,7 @@ export const __testUtils = {
   isPromptAlwaysEnabled,
   buildContextBlock,
   renderPreamble,
+  resolveCallRuntime,
   cumulativeToTurnBuckets: (
     usage: Parameters<UsageTracker["cumulativeToTurnBuckets"]>[0],
   ): TokenBuckets => testTracker.cumulativeToTurnBuckets(usage),

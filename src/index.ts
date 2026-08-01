@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fallbackModels } from "./catalog.js";
 import { registerCommands } from "./commands.js";
 import { CONFIG_PATH_FOR_DIAGNOSTICS, loadConfig } from "./config.js";
-import { createInstanceRuntime, registerProvider } from "./providers.js";
+import { bindSessionRuntime, createInstanceRuntime, registerProvider } from "./providers.js";
 import { applyPermissionOptionCompat } from "./sdk-compat.js";
 import type { RuntimeState } from "./types.js";
 
@@ -33,7 +33,13 @@ export default function piDroid(pi: ExtensionAPI): void {
     runtime.cwd = ctx.cwd;
     // The Pi conversation id keys the Droid session pool: one Droid session
     // per Pi conversation (survives resume; a fresh Pi session → fresh Droid).
-    runtime.sessionKey = ctx.sessionManager.getSessionId?.() ?? ctx.cwd;
+    const sessionId = ctx.sessionManager.getSessionId?.();
+    runtime.sessionKey = sessionId ?? ctx.cwd;
+    // Pi's provider registry is process-wide and last-registration-wins, so the
+    // streamFn that serves this session may be another instance's closure.
+    // Publish this session's runtime under its id so streamDroid can resolve
+    // the true caller per call (stream options carry the session id).
+    if (sessionId) bindSessionRuntime(sessionId, runtime);
     if (ctx.hasUI) {
       const issue = state.catalogIssue;
       if (issue) {
