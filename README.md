@@ -13,7 +13,29 @@ This is an agent-to-agent bridge, not a raw model provider:
 - **Pi owns:** terminal UI, provider/model selection, outer session log, cancellation, and rendering.
 - **Factory Droid owns:** its system prompt, internal conversation, tools, permission protocol, file edits, commands, and tool loop.
 
-Pi's system prompt, AGENTS context, skills, and built-in tool definitions are not forwarded to Droid. The bridge sends the latest user turn to a long-lived Droid session and returns Droid's assistant text/thinking to Pi.
+Pi's built-in tool definitions are never forwarded. **Host context IS forwarded
+by default** (`forwardContext`, disable via config or
+`PI_DROID_FORWARD_CONTEXT=0`): the working directory's `AGENTS.md`
+(persona/long-term memory) and the same skills catalog Pi would inject
+(`~/.pi/agent/skills`, `<cwd>/.pi/skills`, and the `.agents/skills` tiers from
+cwd up to the git root plus `~/.agents/skills`, closest-wins) ride into the
+Droid session as a user-level preamble on its first turn. Skills are plain
+files, so Droid reads the referenced `SKILL.md` with its own tools. When the
+forwarded context changes (persona edited, memory consolidated, skills added),
+the session is transparently recreated so the new context takes effect.
+
+## Session pooling
+
+Droid sessions are pooled **per Pi conversation** (keyed by the Pi session id,
+which survives resume), not kept as a process-wide singleton. This matters for
+daemon hosts that run many Pi sessions concurrently in one process (several
+bots × several chats, e.g. [PIXIU](https://github.com/fatwang2)): each
+conversation gets its own Droid subprocess, so histories never bleed across
+chats, working directories never mix, and a fresh Pi conversation (`/new`,
+idle cutoff) starts a fresh Droid session. Pool bounds: 8 subprocesses max
+(LRU-evicted), 15-minute idle TTL, best-effort close on process exit.
+`session_shutdown` no longer kills sessions — daemon hosts dispose the Pi
+AgentSession after every turn while the conversation continues.
 
 ## Features
 

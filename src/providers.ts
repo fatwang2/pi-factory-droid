@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
+import { formatSkillsForPrompt, loadSkills } from "@earendil-works/pi-coding-agent";
 import {
   calculateCost,
   createAssistantMessageEventStream,
@@ -42,23 +46,11 @@ import type { ResolvedConfig, ResolvedModel, RuntimeState } from "./types.js";
 
 const PROVIDER_DISPLAY_NAME = "Factory Droid";
 
-let session: DroidSession | null = null;
-let activeModelId: string | undefined;
-let resolvedModelId: string | undefined;
-let activeReasoning: ReasoningEffort | undefined;
-let activeCwd = process.cwd();
-let activeKeyHash: string | undefined;
-let lastSpawnAt: number | undefined;
-let lastError: string | undefined;
-let uiRef: ExtensionUIContext | null = null;
-// Droid reports session-cumulative token counters. Pi treats each assistant
-// message usage as a single request and uses it for context % / auto-compact.
-// Track baselines + last-call/context stats so we can report per-turn numbers.
-let usageBaseline: TokenBuckets = emptyBuckets();
-let latestCumulative: TokenBuckets | null = null;
-let lastCallUsage: TokenBuckets | null = null;
-let contextStatsUsed: number | undefined;
-let unsubscribeUsageNotifications: (() => void) | undefined;
+/** Cap on concurrently-open Droid subprocesses (LRU-evicted beyond this). */
+const MAX_POOL_SESSIONS = 8;
+/** Idle Droid sessions are closed after this long without a turn. */
+const IDLE_TTL_MS = 15 * 60 * 1000;
+const SWEEP_INTERVAL_MS = 60 * 1000;
 
 interface TokenBuckets {
   input: number;
@@ -71,26 +63,113 @@ function emptyBuckets(): TokenBuckets {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 }
 
-export function setRuntimeContext(ui: ExtensionUIContext | null, cwd?: string): void {
-  uiRef = ui;
-  if (cwd) activeCwd = cwd;
+/**
+ * Per-conversation runtime context of ONE Pi session (extension instance).
+ * Pi loads extensions per AgentSession, and hosts like PIXIU run MANY
+ * AgentSessions concurrently in one process (several bots × several chats) —
+ * module-level cwd/ui state would race across them, so each instance carries
+ * its own.
+ */
+export interface InstanceRuntime {
+  ui: ExtensionUIContext | null;
+  cwd: string;
+  /**
+   * Stable identity of the Pi CONVERSATION (session id, survives resume).
+   * Keys the Droid session pool: one Droid conversation per Pi conversation,
+   * so a fresh Pi session (/new, idle cutoff) naturally starts a fresh Droid
+   * session, and two chats sharing a cwd never share Droid history.
+   */
+  sessionKey: string;
 }
 
-export function getSessionSnapshot(): {
-  sessionId: string | null;
-  lastSpawnAt: number | undefined;
-  lastError: string | undefined;
-  requestedModel: string | undefined;
-  resolvedModel: string | undefined;
+export function createInstanceRuntime(): InstanceRuntime {
+  return { ui: null, cwd: process.cwd(), sessionKey: process.cwd() };
+}
+
+/**
+ * One pooled Droid session bound to one Pi conversation. Everything that used
+ * to be a module-level singleton (session handle, model settings, usage
+ * tracking) lives here so concurrent conversations can't contaminate each
+ * other — cross-cwd, cross-chat, or cross-bot.
+ */
+interface PoolEntry {
+  key: string;
+  session: DroidSession;
+  cwd: string;
+  keyHash: string;
+  modelId: string;
+  resolvedModelId: string;
   reasoning: ReasoningEffort | undefined;
+  /** Hash of the forwarded context block; a change recreates the session so
+   *  persona/memory/skill edits take effect mid-conversation. */
+  contextHash: string;
+  /** Context preamble to prepend to the FIRST turn after (re)creation. */
+  pendingPreamble: string | null;
+  spawnedAt: number;
+  lastUsedAt: number;
+  usage: UsageTracker;
+}
+
+const pool = new Map<string, PoolEntry>();
+let lastError: string | undefined;
+let sweeper: ReturnType<typeof setInterval> | undefined;
+
+function ensureSweeper(): void {
+  if (sweeper) return;
+  sweeper = setInterval(() => {
+    const cutoff = Date.now() - IDLE_TTL_MS;
+    for (const entry of [...pool.values()]) {
+      if (entry.lastUsedAt < cutoff) void destroyEntry(entry);
+    }
+  }, SWEEP_INTERVAL_MS);
+  sweeper.unref?.();
+  // Best-effort cleanup so a CLI quit doesn't leave droid subprocesses behind.
+  process.once("exit", () => {
+    for (const entry of pool.values()) {
+      try {
+        void entry.session.close();
+      } catch {
+        // exit-time cleanup is best-effort
+      }
+    }
+  });
+}
+
+async function destroyEntry(entry: PoolEntry): Promise<void> {
+  if (pool.get(entry.key) === entry) pool.delete(entry.key);
+  entry.usage.detach();
+  try {
+    await entry.session.close();
+  } catch {
+    // Shutdown must be best-effort.
+  }
+}
+
+export function getPoolSnapshot(): {
+  lastError: string | undefined;
+  entries: Array<{
+    key: string;
+    sessionId: string;
+    requestedModel: string;
+    resolvedModel: string;
+    reasoning: ReasoningEffort | undefined;
+    cwd: string;
+    spawnedAt: number;
+    lastUsedAt: number;
+  }>;
 } {
   return {
-    sessionId: session?.sessionId ?? null,
-    lastSpawnAt,
     lastError,
-    requestedModel: activeModelId,
-    resolvedModel: resolvedModelId,
-    reasoning: activeReasoning,
+    entries: [...pool.values()].map((entry) => ({
+      key: entry.key,
+      sessionId: entry.session.sessionId ?? "?",
+      requestedModel: entry.modelId,
+      resolvedModel: entry.resolvedModelId,
+      reasoning: entry.reasoning,
+      cwd: entry.cwd,
+      spawnedAt: entry.spawnedAt,
+      lastUsedAt: entry.lastUsedAt,
+    })),
   };
 }
 
@@ -98,18 +177,14 @@ export function clearLastError(): void {
   lastError = undefined;
 }
 
-export async function closeSession(): Promise<void> {
-  const current = session;
-  session = null;
-  activeModelId = undefined;
-  resolvedModelId = undefined;
-  activeReasoning = undefined;
-  activeKeyHash = undefined;
-  lastSpawnAt = undefined;
-  resetUsageTracking();
-  if (current) {
+/** Close every pooled Droid session (droid-restart / droid-refresh / tests). */
+export async function closeAllSessions(): Promise<void> {
+  const entries = [...pool.values()];
+  pool.clear();
+  for (const entry of entries) {
+    entry.usage.detach();
     try {
-      await current.close();
+      await entry.session.close();
     } catch {
       // Shutdown must be best-effort.
     }
@@ -120,6 +195,7 @@ export function registerProvider(
   pi: ExtensionAPI,
   cfg: ResolvedConfig,
   state: RuntimeState,
+  runtime: InstanceRuntime,
 ): { totalModels: number } {
   const config: ProviderConfig = {
     name: PROVIDER_DISPLAY_NAME,
@@ -127,7 +203,7 @@ export function registerProvider(
     apiKey: "$FACTORY_API_KEY",
     api: PROVIDER_API,
     models: state.lastModels.map((model) => model.piModel),
-    streamSimple: (model, context, options) => streamDroid(model, context, options, state.cfg),
+    streamSimple: (model, context, options) => streamDroid(model, context, options, state.cfg, runtime),
     refreshModels: async (context) => {
       const cached = await context.store.read();
       if (cached?.models?.length) {
@@ -150,7 +226,7 @@ export function registerProvider(
       }
 
       try {
-        const models = await discoverAccountModels(apiKey, state.cfg, context.signal);
+        const models = await discoverAccountModels(apiKey, state.cfg, runtime, context.signal);
         if (!models.length) {
           state.catalogIssue = emptyModelListIssue();
           return state.lastModels.map((model) => model.piModel);
@@ -174,11 +250,12 @@ export function registerProvider(
 async function discoverAccountModels(
   apiKey: string,
   cfg: ResolvedConfig,
+  runtime: InstanceRuntime,
   signal?: AbortSignal,
 ): Promise<ResolvedModel[]> {
   const discovery = await createSession({
     apiKey,
-    cwd: activeCwd,
+    cwd: runtime.cwd,
     execPath: cfg.droidBinary,
     modelId: cfg.defaultModel,
     autonomyLevel: AutonomyLevel.Low,
@@ -194,17 +271,88 @@ async function discoverAccountModels(
   }
 }
 
-export function wireSessionShutdown(pi: ExtensionAPI): void {
-  pi.on("session_shutdown", async () => {
-    await closeSession();
-  });
+// ---------------------------------------------------------------------------
+// Context forwarding (persona / memory / skills)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the host-context block forwarded into a Droid session: the working
+ * directory's AGENTS.md (persona + long-term memory, regenerated per turn by
+ * hosts like PIXIU) and the same skills catalog Pi would inject for this cwd.
+ * Droid keeps its OWN harness prompt and tools; this rides as user-level
+ * context so the bridged agent still knows who it is and what skills exist
+ * (skills are just files — Droid reads SKILL.md with its own tools).
+ */
+function buildContextBlock(cwd: string, cfg: ResolvedConfig): string {
+  if (!cfg.forwardContext) return "";
+  const parts: string[] = [];
+  const agents = readMaybe(join(cwd, "AGENTS.md"));
+  if (agents?.trim()) parts.push(agents.trim());
+  try {
+    const { skills } = loadSkills({
+      cwd,
+      agentDir: join(homedir(), ".pi", "agent"),
+      // Pi's `.agents/skills` tiers (cwd ancestors + ~/.agents) are discovered
+      // by its package-manager layer, NOT by core loadSkills — walk them
+      // ourselves, closest first so name collisions resolve member > tenant >
+      // global, matching Pi's own precedence.
+      skillPaths: agentsSkillDirs(cwd),
+      includeDefaults: true,
+    });
+    const skillsBlock = formatSkillsForPrompt(skills);
+    if (skillsBlock.trim()) parts.push(skillsBlock.trim());
+  } catch {
+    // Skills are additive context; a scan failure must not break the turn.
+  }
+  return parts.join("\n\n");
 }
+
+/** `.agents/skills` dirs from cwd up to the git root (or fs root), closest
+ *  first, then the user-level `~/.agents/skills`. Only existing dirs. */
+function agentsSkillDirs(cwd: string): string[] {
+  const dirs: string[] = [];
+  let dir = cwd;
+  for (let depth = 0; depth < 32; depth++) {
+    dirs.push(join(dir, ".agents", "skills"));
+    if (existsSync(join(dir, ".git"))) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  dirs.push(join(homedir(), ".agents", "skills"));
+  return dirs.filter((candidate) => existsSync(candidate));
+}
+
+function renderPreamble(contextBlock: string): string {
+  return [
+    "[环境桥接说明] 你通过 Pi 桥接在宿主环境中长期运行。以下是宿主提供的角色设定、长期记忆与可用技能清单——它们定义你是谁、如何行事,优先于一般默认行为。技能(skills)是磁盘上的说明文件:需要某项技能时,用你的文件工具读取对应 SKILL.md 并遵照执行。",
+    "",
+    "<host-context>",
+    contextBlock,
+    "</host-context>",
+    "",
+    "[以下是当前对话消息]",
+  ].join("\n");
+}
+
+function readMaybe(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
 
 function streamDroid(
   model: Model<Api>,
   context: Context,
   options: SimpleStreamOptions | undefined,
   cfg: ResolvedConfig,
+  runtime: InstanceRuntime,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
@@ -230,27 +378,36 @@ function streamDroid(
     const openTextKeys = new Set<string>();
     const openThinkingKeys = new Set<string>();
     let aborted = false;
+    let entryRef: PoolEntry | undefined;
     const onAbort = () => { aborted = true; };
     options?.signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       if (!options?.apiKey) throw new Error("No Factory API key. Run /login droid or set FACTORY_API_KEY.");
       const reasoning = resolveReasoning(model, options.reasoning);
-      const droidSession = await getOrCreateSession(cfg, options.apiKey, model.id, reasoning);
-      beginTurnUsageTracking(droidSession);
+      const contextBlock = buildContextBlock(runtime.cwd, cfg);
+      const entry = await getOrCreateEntry(cfg, options.apiKey, model.id, reasoning, runtime, contextBlock);
+      entryRef = entry;
+      entry.usage.beginTurn(entry.session);
       stream.push({ type: "start", partial: output });
 
       const turn = extractLatestTurn(context);
-      for await (const event of droidSession.stream(turn.text, {
+      let turnText = turn.text;
+      if (entry.pendingPreamble) {
+        turnText = `${entry.pendingPreamble}\n\n${turnText}`;
+        entry.pendingPreamble = null;
+      }
+      for await (const event of entry.session.stream(turnText, {
         abortSignal: options.signal,
         includePartialMessages: true,
         ...(turn.images.length ? { images: turn.images } : {}),
       })) {
-        translate(event, output, stream, indexOf, openTextKeys, openThinkingKeys, model);
+        translate(event, output, stream, indexOf, openTextKeys, openThinkingKeys, model, entry.usage);
       }
 
       if (aborted || options.signal?.aborted) throw new Error("Request was aborted");
-      await finalizeTurnUsage(droidSession, output, model);
+      await entry.usage.finalize(entry.session, output, model);
+      entry.lastUsedAt = Date.now();
       closeOpenBlocks(output, stream, openTextKeys, openThinkingKeys, indexOf);
       stream.push({ type: "done", reason: output.stopReason === "length" ? "length" : "stop", message: output });
       stream.end();
@@ -260,7 +417,7 @@ function streamDroid(
       output.errorMessage = error instanceof Error ? error.message : String(error);
       if (reason === "error") {
         lastError = output.errorMessage;
-        void closeSession();
+        if (entryRef) void destroyEntry(entryRef);
       }
       stream.push({ type: "error", reason, error: output });
       stream.end();
@@ -272,38 +429,60 @@ function streamDroid(
   return stream;
 }
 
-async function getOrCreateSession(
+async function getOrCreateEntry(
   cfg: ResolvedConfig,
   apiKey: string,
   modelId: string,
   reasoning: ReasoningEffort | undefined,
-): Promise<DroidSession> {
+  runtime: InstanceRuntime,
+  contextBlock: string,
+): Promise<PoolEntry> {
+  ensureSweeper();
   const keyHash = createHash("sha256").update(apiKey).digest("hex");
-  if (session && activeKeyHash !== keyHash) await closeSession();
+  const key = `${keyHash}:${runtime.sessionKey}`;
+  const contextHash = contextBlock ? createHash("sha256").update(contextBlock).digest("hex") : "";
 
-  if (session) {
-    if (activeModelId !== modelId || activeReasoning !== reasoning) {
+  let entry = pool.get(key);
+  // Persona/memory/skills changed mid-conversation → restart the Droid session
+  // so the new context takes effect (Droid reads context only at turn input).
+  if (entry && entry.contextHash !== contextHash) {
+    await destroyEntry(entry);
+    entry = undefined;
+  }
+  if (entry) {
+    if (entry.modelId !== modelId || entry.reasoning !== reasoning) {
       try {
-        await session.updateSettings({ modelId, ...(reasoning ? { reasoningEffort: reasoning } : {}) });
-        activeModelId = modelId;
-        resolvedModelId = modelId;
-        activeReasoning = reasoning;
+        await entry.session.updateSettings({ modelId, ...(reasoning ? { reasoningEffort: reasoning } : {}) });
+        entry.modelId = modelId;
+        entry.resolvedModelId = modelId;
+        entry.reasoning = reasoning;
       } catch {
-        await closeSession();
+        await destroyEntry(entry);
+        entry = undefined;
       }
     }
-    if (session) return session;
+  }
+  if (entry) {
+    entry.lastUsedAt = Date.now();
+    return entry;
+  }
+
+  // Room for the new subprocess: evict the least-recently-used entry.
+  while (pool.size >= MAX_POOL_SESSIONS) {
+    const lru = [...pool.values()].sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
+    if (!lru) break;
+    await destroyEntry(lru);
   }
 
   const created = await createSession({
     apiKey,
-    cwd: activeCwd,
+    cwd: runtime.cwd,
     execPath: cfg.droidBinary,
     modelId,
     ...(reasoning ? { reasoningEffort: reasoning } : {}),
     autonomyLevel: autonomyFromAutoLevel(cfg.autoLevel),
-    permissionHandler: createPermissionHandler(cfg),
-    askUserHandler: handleAskUser,
+    permissionHandler: createPermissionHandler(cfg, runtime),
+    askUserHandler: (params) => handleAskUser(params, runtime),
     env: environmentWithKey(apiKey),
   });
 
@@ -313,15 +492,24 @@ async function getOrCreateSession(
     throw new Error(`Droid model mismatch: requested ${modelId}, initialized ${actual}`);
   }
 
-  session = created;
-  activeModelId = modelId;
-  resolvedModelId = actual;
-  activeReasoning = created.initResult.settings.reasoningEffort;
-  activeKeyHash = keyHash;
-  lastSpawnAt = Date.now();
+  const now = Date.now();
+  const fresh: PoolEntry = {
+    key,
+    session: created,
+    cwd: runtime.cwd,
+    keyHash,
+    modelId,
+    resolvedModelId: actual,
+    reasoning: created.initResult.settings.reasoningEffort,
+    contextHash,
+    pendingPreamble: contextBlock ? renderPreamble(contextBlock) : null,
+    spawnedAt: now,
+    lastUsedAt: now,
+    usage: new UsageTracker(),
+  };
+  pool.set(key, fresh);
   lastError = undefined;
-  attachUsageNotifications(created);
-  return created;
+  return fresh;
 }
 
 function environmentWithKey(apiKey: string): Record<string, string> {
@@ -374,7 +562,7 @@ function isSupportedImageType(value: string): boolean {
 // Set PI_DROID_PROMPT_ALWAYS=1 to force the legacy behavior (always ask via
 // Pi UI), useful for users who want to audit every action even at high
 // autonomy.
-function createPermissionHandler(cfg: ResolvedConfig) {
+function createPermissionHandler(cfg: ResolvedConfig, runtime?: InstanceRuntime) {
   return async function handlePermission(
     params: RequestPermissionRequestParams,
   ): Promise<ToolConfirmationOutcome> {
@@ -391,7 +579,7 @@ function createPermissionHandler(cfg: ResolvedConfig) {
           break;
       }
     }
-    return promptViaUi(params);
+    return promptViaUi(params, runtime);
   };
 }
 
@@ -400,8 +588,11 @@ function isPromptAlwaysEnabled(env: Record<string, string | undefined> = process
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 }
 
-async function promptViaUi(params: RequestPermissionRequestParams): Promise<ToolConfirmationOutcome> {
-  const ui = uiRef;
+async function promptViaUi(
+  params: RequestPermissionRequestParams,
+  runtime?: InstanceRuntime,
+): Promise<ToolConfirmationOutcome> {
+  const ui = runtime?.ui ?? null;
   if (!ui) return ToolConfirmationOutcome.Cancel;
   const summary = params.toolUses.map(({ toolUse, details }) => {
     const detail = "fullCommand" in details
@@ -415,8 +606,8 @@ async function promptViaUi(params: RequestPermissionRequestParams): Promise<Tool
   return approved ? ToolConfirmationOutcome.ProceedOnce : ToolConfirmationOutcome.Cancel;
 }
 
-async function handleAskUser(params: AskUserRequestParams): Promise<AskUserResult> {
-  const ui = uiRef;
+async function handleAskUser(params: AskUserRequestParams, runtime?: InstanceRuntime): Promise<AskUserResult> {
+  const ui = runtime?.ui ?? null;
   if (!ui) return { cancelled: true, answers: [] };
   const answers: AskUserResult["answers"] = [];
   for (const question of params.questions) {
@@ -444,6 +635,7 @@ function translate(
   openTextKeys: Set<string>,
   openThinkingKeys: Set<string>,
   model: Model<Api>,
+  usage: UsageTracker,
 ): void {
   switch (event.type) {
     case DroidMessageType.AssistantTextDelta: {
@@ -481,11 +673,11 @@ function translate(
     case DroidMessageType.TokenUsageUpdate:
       // Streamed values are session-cumulative. Convert to per-turn deltas so
       // Pi footer/context math stays sane mid-turn.
-      applyTurnUsage(output, cumulativeToTurnBuckets(event), model, { preferLastCall: false });
+      usage.applyTurnUsage(output, usage.cumulativeToTurnBuckets(event), model, { preferLastCall: false });
       return;
     case DroidMessageType.Result:
       if (event.tokenUsage) {
-        applyTurnUsage(output, cumulativeToTurnBuckets(event.tokenUsage), model, { preferLastCall: false });
+        usage.applyTurnUsage(output, usage.cumulativeToTurnBuckets(event.tokenUsage), model, { preferLastCall: false });
       }
       if (event.isError) throw new Error(event.errors?.join("; ") || event.error?.message || "Droid execution failed");
       return;
@@ -497,145 +689,185 @@ function translate(
   }
 }
 
-function resetUsageTracking(): void {
-  unsubscribeUsageNotifications?.();
-  unsubscribeUsageNotifications = undefined;
-  usageBaseline = emptyBuckets();
-  latestCumulative = null;
-  lastCallUsage = null;
-  contextStatsUsed = undefined;
-}
+// ---------------------------------------------------------------------------
+// Usage tracking (per pool entry)
+// ---------------------------------------------------------------------------
 
-function attachUsageNotifications(droidSession: DroidSession): void {
-  unsubscribeUsageNotifications?.();
-  unsubscribeUsageNotifications = droidSession.onNotification((notification) => {
-    if (notification?.type !== "session_token_usage_changed") return;
-    const lastCall = readTokenBuckets(notification.lastCallTokenUsage);
-    if (lastCall) lastCallUsage = lastCall;
-    const cumulative = readTokenBuckets(notification.tokenUsage)
-      ?? readTokenBuckets(notification.inclusiveTokenUsage);
-    if (cumulative) latestCumulative = cumulative;
-  }, { type: "session_token_usage_changed" });
-}
+/**
+ * Droid reports session-cumulative token counters. Pi treats each assistant
+ * message usage as a single request and uses it for context % / auto-compact.
+ * Track baselines + last-call/context stats PER DROID SESSION so we can report
+ * per-turn numbers — concurrent conversations each keep their own meter.
+ */
+class UsageTracker {
+  private baseline: TokenBuckets = emptyBuckets();
+  private latestCumulative: TokenBuckets | null = null;
+  private lastCallUsage: TokenBuckets | null = null;
+  private contextStatsUsed: number | undefined;
+  private unsubscribe: (() => void) | undefined;
 
-function beginTurnUsageTracking(droidSession: DroidSession): void {
-  lastCallUsage = null;
-  latestCumulative = null;
-  contextStatsUsed = undefined;
-  attachUsageNotifications(droidSession);
-}
-
-async function finalizeTurnUsage(
-  droidSession: DroidSession,
-  output: AssistantMessage,
-  model: Model<Api>,
-): Promise<void> {
-  // Prefer Droid's compaction-meter last-call numbers when raw notifications expose them.
-  if (lastCallUsage) {
-    applyTurnUsage(output, lastCallUsage, model, { preferLastCall: true });
+  reset(): void {
+    this.detach();
+    this.baseline = emptyBuckets();
+    this.latestCumulative = null;
+    this.lastCallUsage = null;
+    this.contextStatsUsed = undefined;
   }
 
-  try {
-    const stats = await droidSession.getContextStats();
-    applyContextStats(output, model, stats);
-  } catch {
-    // getContextStats is best-effort; delta usage and catalog fallback remain available.
+  detach(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
   }
 
-  // Advance baseline from the latest session-cumulative counters when available.
-  if (latestCumulative) {
-    usageBaseline = { ...latestCumulative };
-  } else {
-    usageBaseline = {
-      input: usageBaseline.input + Math.max(0, output.usage.input),
-      output: usageBaseline.output + Math.max(0, output.usage.output),
-      cacheRead: usageBaseline.cacheRead + Math.max(0, output.usage.cacheRead),
-      cacheWrite: usageBaseline.cacheWrite + Math.max(0, output.usage.cacheWrite),
+  private attach(droidSession: DroidSession): void {
+    this.detach();
+    this.unsubscribe = droidSession.onNotification((notification) => {
+      if (notification?.type !== "session_token_usage_changed") return;
+      const lastCall = readTokenBuckets(notification.lastCallTokenUsage);
+      if (lastCall) this.lastCallUsage = lastCall;
+      const cumulative = readTokenBuckets(notification.tokenUsage)
+        ?? readTokenBuckets(notification.inclusiveTokenUsage);
+      if (cumulative) this.latestCumulative = cumulative;
+    }, { type: "session_token_usage_changed" });
+  }
+
+  beginTurn(droidSession: DroidSession): void {
+    this.lastCallUsage = null;
+    this.latestCumulative = null;
+    this.contextStatsUsed = undefined;
+    this.attach(droidSession);
+  }
+
+  async finalize(
+    droidSession: DroidSession,
+    output: AssistantMessage,
+    model: Model<Api>,
+  ): Promise<void> {
+    // Prefer Droid's compaction-meter last-call numbers when raw notifications expose them.
+    if (this.lastCallUsage) {
+      this.applyTurnUsage(output, this.lastCallUsage, model, { preferLastCall: true });
+    }
+
+    try {
+      const stats = await droidSession.getContextStats();
+      this.applyContextStats(output, model, stats);
+    } catch {
+      // getContextStats is best-effort; delta usage and catalog fallback remain available.
+    }
+
+    // Advance baseline from the latest session-cumulative counters when available.
+    if (this.latestCumulative) {
+      this.baseline = { ...this.latestCumulative };
+    } else {
+      this.baseline = {
+        input: this.baseline.input + Math.max(0, output.usage.input),
+        output: this.baseline.output + Math.max(0, output.usage.output),
+        cacheRead: this.baseline.cacheRead + Math.max(0, output.usage.cacheRead),
+        cacheWrite: this.baseline.cacheWrite + Math.max(0, output.usage.cacheWrite),
+      };
+    }
+  }
+
+  applyContextStats(
+    output: AssistantMessage,
+    model: Model<Api>,
+    stats: { used?: unknown; limit?: unknown; [key: string]: unknown },
+  ): void {
+    const limit = positiveNumberOrUndefined(stats.limit);
+    if (limit !== undefined) {
+      // Droid's context meter reports the active model's effective max input,
+      // including reasoning-effort and regional routing adjustments. Pi compares
+      // usage.totalTokens against model.contextWindow for auto-compaction, so the
+      // two values must describe the same budget. Mutating the active model here
+      // prevents Pi's conservative catalog fallback (for example 128k for GLM)
+      // from compacting before Droid's own context manager needs to.
+      model.contextWindow = Math.round(limit);
+    }
+
+    const used = nonNegativeNumberOrUndefined(stats.used);
+    if (used !== undefined) {
+      this.contextStatsUsed = used;
+      // Pi context % uses usage.totalTokens. Keep input/output/cache as per-turn
+      // deltas for the footer counters while reporting real window occupancy.
+      output.usage.totalTokens = Math.round(used);
+      output.usage.cost = calculateCost(model, output.usage);
+    }
+  }
+
+  cumulativeToTurnBuckets(
+    usage: {
+      inputTokens?: number;
+      outputTokens?: number;
+      thinkingTokens?: number;
+      cacheReadTokens?: number;
+      cacheCreationTokens?: number;
+    },
+  ): TokenBuckets {
+    const cumulative: TokenBuckets = {
+      input: usage.inputTokens ?? 0,
+      output: (usage.outputTokens ?? 0) + (usage.thinkingTokens ?? 0),
+      cacheRead: usage.cacheReadTokens ?? 0,
+      cacheWrite: usage.cacheCreationTokens ?? 0,
+    };
+    this.latestCumulative = cumulative;
+    return {
+      input: Math.max(0, cumulative.input - this.baseline.input),
+      output: Math.max(0, cumulative.output - this.baseline.output),
+      cacheRead: Math.max(0, cumulative.cacheRead - this.baseline.cacheRead),
+      cacheWrite: Math.max(0, cumulative.cacheWrite - this.baseline.cacheWrite),
     };
   }
-}
 
-function applyContextStats(
-  output: AssistantMessage,
-  model: Model<Api>,
-  stats: { used?: unknown; limit?: unknown; [key: string]: unknown },
-): void {
-  const limit = positiveNumberOrUndefined(stats.limit);
-  if (limit !== undefined) {
-    // Droid's context meter reports the active model's effective max input,
-    // including reasoning-effort and regional routing adjustments. Pi compares
-    // usage.totalTokens against model.contextWindow for auto-compaction, so the
-    // two values must describe the same budget. Mutating the active model here
-    // prevents Pi's conservative catalog fallback (for example 128k for GLM)
-    // from compacting before Droid's own context manager needs to.
-    model.contextWindow = Math.round(limit);
-  }
+  applyTurnUsage(
+    output: AssistantMessage,
+    turn: TokenBuckets,
+    model: Model<Api>,
+    opts: { preferLastCall: boolean },
+  ): void {
+    // lastCall is authoritative for prompt/cache size when present; keep the
+    // larger output delta if stream cumulative saw more generation tokens.
+    if (opts.preferLastCall) {
+      output.usage.input = turn.input;
+      output.usage.cacheRead = turn.cacheRead;
+      output.usage.cacheWrite = turn.cacheWrite;
+      output.usage.output = Math.max(output.usage.output, turn.output);
+    } else {
+      output.usage.input = turn.input;
+      output.usage.output = turn.output;
+      output.usage.cacheRead = turn.cacheRead;
+      output.usage.cacheWrite = turn.cacheWrite;
+    }
 
-  const used = nonNegativeNumberOrUndefined(stats.used);
-  if (used !== undefined) {
-    contextStatsUsed = used;
-    // Pi context % uses usage.totalTokens. Keep input/output/cache as per-turn
-    // deltas for the footer counters while reporting real window occupancy.
-    output.usage.totalTokens = Math.round(used);
+    // Context occupancy for Pi: prefer exact meter, else prompt-side tokens only.
+    // Do not sum multi-million cumulative cache reads into totalTokens — that was
+    // blowing past contextWindow and forcing auto-compact every turn.
+    if (this.contextStatsUsed !== undefined) {
+      output.usage.totalTokens = Math.round(this.contextStatsUsed);
+    } else {
+      const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
+      const contextCap = model.contextWindow > 0 ? model.contextWindow : Number.POSITIVE_INFINITY;
+      output.usage.totalTokens = Math.round(Math.min(promptTokens, contextCap));
+    }
     output.usage.cost = calculateCost(model, output.usage);
   }
-}
 
-function cumulativeToTurnBuckets(
-  usage: {
-    inputTokens?: number;
-    outputTokens?: number;
-    thinkingTokens?: number;
-    cacheReadTokens?: number;
-    cacheCreationTokens?: number;
-  },
-): TokenBuckets {
-  const cumulative: TokenBuckets = {
-    input: usage.inputTokens ?? 0,
-    output: (usage.outputTokens ?? 0) + (usage.thinkingTokens ?? 0),
-    cacheRead: usage.cacheReadTokens ?? 0,
-    cacheWrite: usage.cacheCreationTokens ?? 0,
-  };
-  latestCumulative = cumulative;
-  return {
-    input: Math.max(0, cumulative.input - usageBaseline.input),
-    output: Math.max(0, cumulative.output - usageBaseline.output),
-    cacheRead: Math.max(0, cumulative.cacheRead - usageBaseline.cacheRead),
-    cacheWrite: Math.max(0, cumulative.cacheWrite - usageBaseline.cacheWrite),
-  };
-}
-
-function applyTurnUsage(
-  output: AssistantMessage,
-  turn: TokenBuckets,
-  model: Model<Api>,
-  opts: { preferLastCall: boolean },
-): void {
-  // lastCall is authoritative for prompt/cache size when present; keep the
-  // larger output delta if stream cumulative saw more generation tokens.
-  if (opts.preferLastCall) {
-    output.usage.input = turn.input;
-    output.usage.cacheRead = turn.cacheRead;
-    output.usage.cacheWrite = turn.cacheWrite;
-    output.usage.output = Math.max(output.usage.output, turn.output);
-  } else {
-    output.usage.input = turn.input;
-    output.usage.output = turn.output;
-    output.usage.cacheRead = turn.cacheRead;
-    output.usage.cacheWrite = turn.cacheWrite;
+  // Test hooks (see __testUtils).
+  setBaseline(baseline: TokenBuckets): void {
+    this.baseline = { ...baseline };
   }
-
-  // Context occupancy for Pi: prefer exact meter, else prompt-side tokens only.
-  // Do not sum multi-million cumulative cache reads into totalTokens — that was
-  // blowing past contextWindow and forcing auto-compact every turn.
-  if (contextStatsUsed !== undefined) {
-    output.usage.totalTokens = Math.round(contextStatsUsed);
-  } else {
-    const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
-    const contextCap = model.contextWindow > 0 ? model.contextWindow : Number.POSITIVE_INFINITY;
-    output.usage.totalTokens = Math.round(Math.min(promptTokens, contextCap));
+  getBaseline(): TokenBuckets {
+    return { ...this.baseline };
   }
-  output.usage.cost = calculateCost(model, output.usage);
+  setLastCall(usage: TokenBuckets | null): void {
+    this.lastCallUsage = usage ? { ...usage } : null;
+  }
+  setContextStatsUsed(used: number | undefined): void {
+    this.contextStatsUsed = used;
+  }
+  advanceBaselineFromCumulative(cumulative: TokenBuckets): void {
+    this.latestCumulative = { ...cumulative };
+    this.baseline = { ...cumulative };
+  }
 }
 
 function readTokenBuckets(value: unknown): TokenBuckets | null {
@@ -698,28 +930,49 @@ function closeOpenBlocks(
   openThinkingKeys.clear();
 }
 
+// ---------------------------------------------------------------------------
+// Test utilities — a dedicated tracker instance keeps the historical
+// function-shaped API stable for the test suite.
+// ---------------------------------------------------------------------------
+
+let testTracker = new UsageTracker();
+
 export const __testUtils = {
   createPermissionHandler,
   isPromptAlwaysEnabled,
-  cumulativeToTurnBuckets,
-  applyTurnUsage,
-  applyContextStats,
+  buildContextBlock,
+  renderPreamble,
+  cumulativeToTurnBuckets: (
+    usage: Parameters<UsageTracker["cumulativeToTurnBuckets"]>[0],
+  ): TokenBuckets => testTracker.cumulativeToTurnBuckets(usage),
+  applyTurnUsage: (
+    output: AssistantMessage,
+    turn: TokenBuckets,
+    model: Model<Api>,
+    opts: { preferLastCall: boolean },
+  ): void => testTracker.applyTurnUsage(output, turn, model, opts),
+  applyContextStats: (
+    output: AssistantMessage,
+    model: Model<Api>,
+    stats: { used?: unknown; limit?: unknown; [key: string]: unknown },
+  ): void => testTracker.applyContextStats(output, model, stats),
   readTokenBuckets,
-  resetUsageTracking,
+  resetUsageTracking(): void {
+    testTracker = new UsageTracker();
+  },
   setUsageBaselineForTest(baseline: TokenBuckets): void {
-    usageBaseline = { ...baseline };
+    testTracker.setBaseline(baseline);
   },
   getUsageBaselineForTest(): TokenBuckets {
-    return { ...usageBaseline };
+    return testTracker.getBaseline();
   },
   setLastCallUsageForTest(usage: TokenBuckets | null): void {
-    lastCallUsage = usage ? { ...usage } : null;
+    testTracker.setLastCall(usage);
   },
   setContextStatsUsedForTest(used: number | undefined): void {
-    contextStatsUsed = used;
+    testTracker.setContextStatsUsed(used);
   },
   advanceBaselineFromCumulativeForTest(cumulative: TokenBuckets): void {
-    latestCumulative = { ...cumulative };
-    usageBaseline = { ...cumulative };
+    testTracker.advanceBaselineFromCumulative(cumulative);
   },
 };

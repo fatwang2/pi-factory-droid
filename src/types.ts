@@ -25,6 +25,9 @@ export interface ConfigFile {
   autoLevel?: AutoLevel;
   defaultModel?: string;
   strictModelMatch?: boolean;
+  /** Forward the host's AGENTS.md + skills catalog into Droid sessions
+   *  (default true). Disable to keep Droid fully context-blind. */
+  forwardContext?: boolean;
   models?: Record<string, ModelOverride>;
 }
 
@@ -33,6 +36,7 @@ export interface ResolvedConfig {
   autoLevel: AutoLevel;
   defaultModel: string;
   strictModelMatch: boolean;
+  forwardContext: boolean;
   modelOverrides: Record<string, ModelOverride>;
   loadedFrom?: string;
 }

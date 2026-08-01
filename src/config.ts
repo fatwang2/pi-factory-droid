@@ -13,14 +13,25 @@ export function loadConfig(): ResolvedConfig {
   const envBinary = process.env.DROID_BINARY?.trim();
   const envAutoLevel = coerceAutoLevel(process.env.DROID_AUTO_LEVEL?.trim());
 
+  const envForward = coerceBooleanEnv(process.env.PI_DROID_FORWARD_CONTEXT);
+
   return {
     droidBinary: envBinary || fromFile.parsed.droidBinary?.trim() || DEFAULT_DROID_BINARY,
     autoLevel: envAutoLevel ?? coerceAutoLevel(fromFile.parsed.autoLevel) ?? DEFAULT_AUTO_LEVEL,
     defaultModel: fromFile.parsed.defaultModel?.trim() || DEFAULT_MODEL,
     strictModelMatch: fromFile.parsed.strictModelMatch ?? true,
+    forwardContext: envForward ?? fromFile.parsed.forwardContext ?? true,
     modelOverrides: normalizeModelOverrides(fromFile.parsed.models),
     loadedFrom: fromFile.exists ? CONFIG_PATH : undefined,
   };
+}
+
+function coerceBooleanEnv(raw: string | undefined): boolean | undefined {
+  const value = raw?.trim().toLowerCase();
+  if (value === undefined || value === "") return undefined;
+  if (value === "1" || value === "true" || value === "yes" || value === "on") return true;
+  if (value === "0" || value === "false" || value === "no" || value === "off") return false;
+  return undefined;
 }
 
 function readConfigFile(path: string): { exists: boolean; parsed: ConfigFile } {

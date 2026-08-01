@@ -12,6 +12,7 @@ function makeCfg(autoLevel: "low" | "medium" | "high"): ResolvedConfig {
     autoLevel,
     defaultModel: "auto",
     strictModelMatch: true,
+    forwardContext: true,
     modelOverrides: {},
   };
 }

@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fallbackModels } from "./catalog.js";
 import { registerCommands } from "./commands.js";
 import { CONFIG_PATH_FOR_DIAGNOSTICS, loadConfig } from "./config.js";
-import { registerProvider, setRuntimeContext, wireSessionShutdown } from "./providers.js";
+import { createInstanceRuntime, registerProvider } from "./providers.js";
 import { applyPermissionOptionCompat } from "./sdk-compat.js";
 import type { RuntimeState } from "./types.js";
 
@@ -20,12 +20,20 @@ export default function piDroid(pi: ExtensionAPI): void {
     catalogSource: "fallback",
   };
 
-  const stats = registerProvider(pi, cfg, state);
-  wireSessionShutdown(pi);
+  // Per-extension-instance runtime: Pi loads extensions per AgentSession, and
+  // daemon hosts (e.g. PIXIU) run many sessions concurrently in one process —
+  // cwd/ui/session identity must not live in module-level globals.
+  const runtime = createInstanceRuntime();
+
+  const stats = registerProvider(pi, cfg, state, runtime);
   registerCommands(pi, state);
 
   pi.on("session_start", async (_event, ctx) => {
-    setRuntimeContext(ctx.hasUI ? ctx.ui : null, ctx.cwd);
+    runtime.ui = ctx.hasUI ? ctx.ui : null;
+    runtime.cwd = ctx.cwd;
+    // The Pi conversation id keys the Droid session pool: one Droid session
+    // per Pi conversation (survives resume; a fresh Pi session → fresh Droid).
+    runtime.sessionKey = ctx.sessionManager.getSessionId?.() ?? ctx.cwd;
     if (ctx.hasUI) {
       const issue = state.catalogIssue;
       if (issue) {
@@ -49,6 +57,11 @@ export default function piDroid(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    setRuntimeContext(null);
+    // NOTE: deliberately NOT closing Droid sessions here. Daemon hosts dispose
+    // the Pi AgentSession after every turn while the CONVERSATION continues
+    // (resumed next turn) — closing here gave Droid per-turn amnesia and let
+    // concurrent turns kill each other's subprocess. Pooled sessions are
+    // reclaimed by idle TTL / LRU eviction / process exit instead.
+    runtime.ui = null;
   });
 }

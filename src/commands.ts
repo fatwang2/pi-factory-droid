@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
-import { clearLastError, closeSession, getSessionSnapshot } from "./providers.js";
+import { clearLastError, closeAllSessions, getPoolSnapshot } from "./providers.js";
 import type { RuntimeState } from "./types.js";
 
 const PROMPT_ALWAYS_ENV = "PI_DROID_PROMPT_ALWAYS";
@@ -15,17 +15,22 @@ export function registerCommands(pi: ExtensionAPI, state: RuntimeState): void {
   pi.registerCommand("droid-status", {
     description: "Show Factory Droid catalog, model, harness, and subprocess state.",
     handler: async (_args, ctx) => {
-      const snapshot = getSessionSnapshot();
+      const snapshot = getPoolSnapshot();
       const issue = state.catalogIssue;
       const issueLine = issue
         ? `  catalog issue=${issue.reason}: ${issue.message}${issue.errorMessage ? ` (${issue.errorMessage})` : ""}`
         : "  catalog issue=none";
+      const sessionLines = snapshot.entries.length
+        ? snapshot.entries.map((entry) =>
+            `  session ${entry.sessionId.slice(0, 8)} (${formatAge(entry.spawnedAt)}, used ${formatAge(entry.lastUsedAt)}) ` +
+            `model=${entry.requestedModel}→${entry.resolvedModel} reasoning=${entry.reasoning ?? "default"} cwd=${entry.cwd}`)
+        : ["  no active droid sessions"];
       const lines = [
-        `droid: ${snapshot.sessionId ? `session ${snapshot.sessionId.slice(0, 8)} (${formatAge(snapshot.lastSpawnAt)})` : "no active session"}`,
-        `  model=${snapshot.requestedModel ?? "none"} | resolved=${snapshot.resolvedModel ?? "none"} | reasoning=${snapshot.reasoning ?? "default"}`,
+        `droid: ${snapshot.entries.length} pooled session(s)`,
+        ...sessionLines,
         `  catalog=${state.catalogSource} (${state.lastModels.length} models)${state.catalogUpdatedAt ? `, ${formatAge(state.catalogUpdatedAt)}` : ""}`,
-        `  autonomy=${state.cfg.autoLevel} | permissions=${resolvePermissionMode(state.cfg.autoLevel)} | binary=${state.cfg.droidBinary} | strictModelMatch=${state.cfg.strictModelMatch}`,
-        `  harness=Factory Droid (Pi supplies UI/provider transport; Droid owns system prompt and tools)`,
+        `  autonomy=${state.cfg.autoLevel} | permissions=${resolvePermissionMode(state.cfg.autoLevel)} | binary=${state.cfg.droidBinary} | strictModelMatch=${state.cfg.strictModelMatch} | forwardContext=${state.cfg.forwardContext}`,
+        `  harness=Factory Droid (Pi supplies UI/provider transport; Droid owns tools; host persona/skills forwarded as context when enabled)`,
         `  last error=${snapshot.lastError ?? "none"}`,
         issueLine,
         `  config=${state.cfg.loadedFrom ?? "defaults"}`,
@@ -60,7 +65,7 @@ export function registerCommands(pi: ExtensionAPI, state: RuntimeState): void {
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
       state.cfg = loadConfig();
-      await closeSession();
+      await closeAllSessions();
       clearLastError();
       await ctx.modelRegistry.refresh();
       const issue = state.catalogIssue;
@@ -72,19 +77,19 @@ export function registerCommands(pi: ExtensionAPI, state: RuntimeState): void {
   });
 
   pi.registerCommand("droid-restart", {
-    description: "Close the Droid subprocess; the next turn creates a new session.",
+    description: "Close all pooled Droid subprocesses; next turns create fresh sessions.",
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
-      await closeSession();
+      await closeAllSessions();
       clearLastError();
-      notify(ctx, "Droid subprocess closed. The next Droid turn will create a new session.", "info");
+      notify(ctx, "All Droid sessions closed. Next Droid turns will create fresh sessions.", "info");
     },
   });
 
   pi.registerCommand("droid-harness", {
     description: "Explain which harness runs when using the Droid provider.",
     handler: async (_args, ctx) => {
-      const text = "Factory Droid owns the model system prompt, conversation state, tool loop, permissions, and file/command execution. Pi is the outer UI, model selector, session log, and provider transport. Pi's system prompt and built-in tools are not forwarded into Droid.";
+      const text = "Factory Droid owns the model system prompt, tool loop, permissions, and file/command execution. Pi is the outer UI, model selector, session log, and provider transport. Droid sessions are pooled per Pi conversation (no cross-chat contamination). With forwardContext enabled (default), the host's AGENTS.md (persona/memory) and skills catalog are forwarded as user-level context and refreshed when they change; Pi's built-in tool definitions are never forwarded.";
       console.log(`[pi-droid] ${text}`);
       if (ctx.hasUI) ctx.ui.notify(text, "info");
     },
