@@ -27,6 +27,7 @@ import {
   type DroidMessage,
   type DroidSession,
   type RequestPermissionRequestParams,
+  type SdkMcpServer,
 } from "@factory/droid-sdk";
 import {
   PROVIDER_API,
@@ -42,6 +43,20 @@ import {
   missingApiKeyIssue,
   type CatalogFallbackIssue,
 } from "./fallback-issue.js";
+import {
+  buildPiToolsMcpServer,
+  PiToolsBridgeBoard,
+  selectDisableToolIds,
+} from "./pi-tools-bridge.js";
+import {
+  attachPiStream,
+  createEmptyOutput,
+  deliverPiToolResults,
+  isAwaitingPiTools,
+  runPiToolsConsumer,
+  toolsFingerprintOf,
+  type PiToolsTurnState,
+} from "./pi-tools-mode.js";
 import type { ResolvedConfig, ResolvedModel, RuntimeState } from "./types.js";
 
 const PROVIDER_DISPLAY_NAME = "Factory Droid";
@@ -149,6 +164,13 @@ interface PoolEntry {
   spawnedAt: number;
   lastUsedAt: number;
   usage: UsageTracker;
+  /** agent (default) or pi-tools bridge session. */
+  mode: ResolvedConfig["mode"];
+  /** Fingerprint of Pi tools registered into the MCP server (pi-tools only). */
+  toolsHash?: string;
+  board?: PiToolsBridgeBoard;
+  mcpServer?: SdkMcpServer;
+  activeTurn?: PiToolsTurnState | null;
 }
 
 const pool = new Map<string, PoolEntry>();
@@ -179,6 +201,14 @@ function ensureSweeper(): void {
 async function destroyEntry(entry: PoolEntry): Promise<void> {
   if (pool.get(entry.key) === entry) pool.delete(entry.key);
   entry.usage.detach();
+  entry.activeTurn?.consumerAbort.abort();
+  entry.board?.rejectAll("droid session closed");
+  entry.activeTurn = null;
+  try {
+    await entry.mcpServer?.close();
+  } catch {
+    // ignore
+  }
   try {
     await entry.session.close();
   } catch {
@@ -224,6 +254,14 @@ export async function closeAllSessions(): Promise<void> {
   pool.clear();
   for (const entry of entries) {
     entry.usage.detach();
+    entry.activeTurn?.consumerAbort.abort();
+    entry.board?.rejectAll("droid sessions closed");
+    entry.activeTurn = null;
+    try {
+      await entry.mcpServer?.close();
+    } catch {
+      // ignore
+    }
     try {
       await entry.session.close();
     } catch {
@@ -399,6 +437,121 @@ function streamDroid(
   // (shared provider registry, last registration wins) — resolve the actual
   // caller from the per-call session id.
   const runtime = resolveCallRuntime(options, instanceRuntime);
+  if (cfg.mode === "pi-tools") {
+    return streamDroidPiTools(model, context, options, cfg, runtime);
+  }
+  return streamDroidAgent(model, context, options, cfg, runtime);
+}
+
+function streamDroidPiTools(
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  cfg: ResolvedConfig,
+  runtime: InstanceRuntime,
+): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+
+  void (async () => {
+    let entryRef: PoolEntry | undefined;
+    try {
+      if (!options?.apiKey) throw new Error("No Factory API key. Run /login droid or set FACTORY_API_KEY.");
+      const reasoning = resolveReasoning(model, options.reasoning);
+      const contextBlock = buildContextBlock(runtime.cwd, cfg);
+      const toolsHash = toolsFingerprintOf(context);
+      const entry = await getOrCreateEntry(cfg, options.apiKey, model.id, reasoning, runtime, contextBlock, {
+        mode: "pi-tools",
+        tools: context.tools,
+        toolsHash,
+      });
+      entryRef = entry;
+      entry.lastUsedAt = Date.now();
+
+      // Continuation: Pi executed tools and is delivering results into the hanging MCP handlers.
+      if (isAwaitingPiTools(entry.activeTurn) && entry.board) {
+        deliverPiToolResults(entry.board, context);
+        attachPiStream(entry.activeTurn!, stream);
+        return;
+      }
+
+      // New user turn.
+      if (entry.activeTurn && entry.activeTurn.phase !== "idle") {
+        entry.activeTurn.consumerAbort.abort();
+        entry.board?.rejectAll("superseded by new pi-tools turn");
+        entry.activeTurn = null;
+      }
+
+      entry.usage.beginTurn(entry.session);
+      const turnState: PiToolsTurnState = {
+        phase: "streaming",
+        piStream: stream,
+        output: createEmptyOutput(model),
+        model,
+        indexOf: new Map(),
+        openTextKeys: new Set(),
+        openThinkingKeys: new Set(),
+        consumerAbort: new AbortController(),
+        consumerDone: Promise.resolve(),
+      };
+      entry.activeTurn = turnState;
+      stream.push({ type: "start", partial: turnState.output });
+
+      const turn = extractLatestTurn(context);
+      let turnText = turn.text;
+      if (entry.pendingPreamble) {
+        turnText = `${entry.pendingPreamble}\n\n${turnText}`;
+        entry.pendingPreamble = null;
+      }
+      // Steer the model toward MCP tools only (ToolSearch may still run).
+      const steer =
+        "You are running inside Pi via a tool bridge. " +
+        "Use only the pi-tools MCP tools for file/shell/search work. " +
+        "Do not claim tools are unavailable — call them.";
+      turnText = `${steer}\n\n${turnText}`;
+
+      turnState.consumerDone = runPiToolsConsumer({
+        session: entry.session,
+        board: entry.board!,
+        turn: turnState,
+        prompt: turnText,
+        images: turn.images,
+        signal: options.signal,
+        onUsage: (output) => {
+          // Best-effort: copy cumulative usage through existing tracker when result lands.
+          void entry.usage.finalize(entry.session, output, model).catch(() => {
+            calculateCost(model, output.usage);
+          });
+        },
+      }).then(() => {
+        if (entry.activeTurn === turnState && turnState.phase === "idle") {
+          entry.activeTurn = null;
+        }
+        entry.lastUsedAt = Date.now();
+      });
+    } catch (error) {
+      const output = createEmptyOutput(model);
+      const reason: "aborted" | "error" = options?.signal?.aborted ? "aborted" : "error";
+      output.stopReason = reason;
+      output.errorMessage = error instanceof Error ? error.message : String(error);
+      if (reason === "error") {
+        lastError = output.errorMessage;
+        if (entryRef) void destroyEntry(entryRef);
+      }
+      stream.push({ type: "error", reason, error: output });
+      stream.end();
+    }
+  })();
+
+  return stream;
+}
+
+function streamDroidAgent(
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  cfg: ResolvedConfig,
+  runtime: InstanceRuntime,
+): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
 
   void (async () => {
@@ -431,7 +584,9 @@ function streamDroid(
       if (!options?.apiKey) throw new Error("No Factory API key. Run /login droid or set FACTORY_API_KEY.");
       const reasoning = resolveReasoning(model, options.reasoning);
       const contextBlock = buildContextBlock(runtime.cwd, cfg);
-      const entry = await getOrCreateEntry(cfg, options.apiKey, model.id, reasoning, runtime, contextBlock);
+      const entry = await getOrCreateEntry(cfg, options.apiKey, model.id, reasoning, runtime, contextBlock, {
+        mode: "agent",
+      });
       entryRef = entry;
       entry.usage.beginTurn(entry.session);
       stream.push({ type: "start", partial: output });
@@ -481,16 +636,31 @@ async function getOrCreateEntry(
   reasoning: ReasoningEffort | undefined,
   runtime: InstanceRuntime,
   contextBlock: string,
+  opts: {
+    mode: ResolvedConfig["mode"];
+    tools?: Context["tools"];
+    toolsHash?: string;
+  },
 ): Promise<PoolEntry> {
   ensureSweeper();
   const keyHash = createHash("sha256").update(apiKey).digest("hex");
-  const key = `${keyHash}:${runtime.sessionKey}`;
+  // Separate pools per mode so flipping agent↔pi-tools never reuses the wrong session.
+  const key = `${keyHash}:${runtime.sessionKey}:${opts.mode}`;
   const contextHash = contextBlock ? createHash("sha256").update(contextBlock).digest("hex") : "";
 
   let entry = pool.get(key);
   // Persona/memory/skills changed mid-conversation → restart the Droid session
   // so the new context takes effect (Droid reads context only at turn input).
   if (entry && entry.contextHash !== contextHash) {
+    await destroyEntry(entry);
+    entry = undefined;
+  }
+  // Pi tool set changed → MCP server must be rebuilt.
+  if (entry && opts.mode === "pi-tools" && entry.toolsHash !== opts.toolsHash) {
+    await destroyEntry(entry);
+    entry = undefined;
+  }
+  if (entry && entry.mode !== opts.mode) {
     await destroyEntry(entry);
     entry = undefined;
   }
@@ -519,6 +689,10 @@ async function getOrCreateEntry(
     await destroyEntry(lru);
   }
 
+  const board = opts.mode === "pi-tools" ? new PiToolsBridgeBoard() : undefined;
+  const tools = (opts.tools ?? []) as NonNullable<Context["tools"]>;
+  const mcpServer = board ? buildPiToolsMcpServer(tools, board) : undefined;
+
   const created = await createSession({
     apiKey,
     cwd: runtime.cwd,
@@ -529,12 +703,28 @@ async function getOrCreateEntry(
     permissionHandler: createPermissionHandler(cfg, runtime),
     askUserHandler: (params) => handleAskUser(params, runtime),
     env: environmentWithKey(apiKey),
+    ...(mcpServer ? { mcpServers: [mcpServer] } : {}),
   });
 
   const actual = created.initResult.settings.modelId;
   if (cfg.strictModelMatch && modelId !== "auto" && actual !== modelId) {
     await created.close();
+    await mcpServer?.close().catch(() => {});
     throw new Error(`Droid model mismatch: requested ${modelId}, initialized ${actual}`);
+  }
+
+  if (opts.mode === "pi-tools") {
+    try {
+      const listed = await created.listTools();
+      const disableIds = selectDisableToolIds(listed.tools ?? [], tools);
+      if (disableIds.length) {
+        await created.updateSettings({ disabledToolIds: disableIds });
+      }
+    } catch (error) {
+      await created.close().catch(() => {});
+      await mcpServer?.close().catch(() => {});
+      throw error;
+    }
   }
 
   const now = Date.now();
@@ -551,6 +741,11 @@ async function getOrCreateEntry(
     spawnedAt: now,
     lastUsedAt: now,
     usage: new UsageTracker(),
+    mode: opts.mode,
+    toolsHash: opts.toolsHash,
+    board,
+    mcpServer,
+    activeTurn: null,
   };
   pool.set(key, fresh);
   lastError = undefined;

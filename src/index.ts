@@ -47,7 +47,7 @@ export default function piDroid(pi: ExtensionAPI): void {
       } else {
         const configHint = cfg.loadedFrom ? "" : `; defaults (no ${CONFIG_PATH_FOR_DIAGNOSTICS})`;
         ctx.ui.notify(
-          `pi-droid local: ${stats.totalModels} fallback models; account catalog refreshes after authentication; autonomy=${state.cfg.autoLevel}${configHint}.`,
+          `pi-droid local: ${stats.totalModels} fallback models; account catalog refreshes after authentication; mode=${state.cfg.mode}; autonomy=${state.cfg.autoLevel}${configHint}.`,
           "info",
         );
       }

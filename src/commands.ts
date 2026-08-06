@@ -29,8 +29,10 @@ export function registerCommands(pi: ExtensionAPI, state: RuntimeState): void {
         `droid: ${snapshot.entries.length} pooled session(s)`,
         ...sessionLines,
         `  catalog=${state.catalogSource} (${state.lastModels.length} models)${state.catalogUpdatedAt ? `, ${formatAge(state.catalogUpdatedAt)}` : ""}`,
-        `  autonomy=${state.cfg.autoLevel} | permissions=${resolvePermissionMode(state.cfg.autoLevel)} | binary=${state.cfg.droidBinary} | strictModelMatch=${state.cfg.strictModelMatch} | forwardContext=${state.cfg.forwardContext}`,
-        `  harness=Factory Droid (Pi supplies UI/provider transport; Droid owns tools; host persona/skills forwarded as context when enabled)`,
+        `  mode=${state.cfg.mode} | autonomy=${state.cfg.autoLevel} | permissions=${resolvePermissionMode(state.cfg.autoLevel)} | binary=${state.cfg.droidBinary} | strictModelMatch=${state.cfg.strictModelMatch} | forwardContext=${state.cfg.forwardContext}`,
+        `  harness=${state.cfg.mode === "pi-tools"
+          ? "hybrid (Droid session + Pi tool execution via MCP bridge; ToolSearch may remain)"
+          : "Factory Droid (Pi supplies UI/provider transport; Droid owns tools; host persona/skills forwarded as context when enabled)"}`,
         `  last error=${snapshot.lastError ?? "none"}`,
         issueLine,
         `  config=${state.cfg.loadedFrom ?? "defaults"}`,
@@ -89,7 +91,23 @@ export function registerCommands(pi: ExtensionAPI, state: RuntimeState): void {
   pi.registerCommand("droid-harness", {
     description: "Explain which harness runs when using the Droid provider.",
     handler: async (_args, ctx) => {
-      const text = "Factory Droid owns the model system prompt, tool loop, permissions, and file/command execution. Pi is the outer UI, model selector, session log, and provider transport. Droid sessions are pooled per Pi conversation (no cross-chat contamination). With forwardContext enabled (default), the host's AGENTS.md (persona/memory) and skills catalog are forwarded as user-level context and refreshed when they change; Pi's built-in tool definitions are never forwarded.";
+      const mode = state.cfg.mode;
+      const text = mode === "pi-tools"
+        ? [
+            "mode=pi-tools (experimental hybrid bridge).",
+            "Droid still owns the cloud session, system prompt, compaction, and model billing.",
+            "Native Droid tools are disabled (ToolSearch may remain); Pi tools are injected as an SDK MCP server.",
+            "When Droid calls a pi-tools MCP tool, the MCP handler suspends and Pi executes the tool, then the next streamSimple delivers the result.",
+            "This is NOT a raw LLM provider (unlike antigravity): it is claude-bridge-style tool bridging on top of Droid.",
+            "Set mode via ~/.pi/agent/droid.json { \"mode\": \"pi-tools\" } or PI_DROID_MODE=pi-tools.",
+          ].join(" ")
+        : [
+            "mode=agent (default).",
+            "Factory Droid owns the model system prompt, tool loop, permissions, and file/command execution.",
+            "Pi is the outer UI, model selector, session log, and provider transport.",
+            "Droid sessions are pooled per Pi conversation. With forwardContext enabled (default), AGENTS.md and skills ride as user-level context; Pi built-in tool definitions are never forwarded.",
+            "Switch to hybrid Pi tool execution with { \"mode\": \"pi-tools\" } in ~/.pi/agent/droid.json.",
+          ].join(" ");
       console.log(`[pi-droid] ${text}`);
       if (ctx.hasUI) ctx.ui.notify(text, "info");
     },

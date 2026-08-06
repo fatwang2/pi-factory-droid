@@ -4,6 +4,8 @@ import type { CatalogFallbackIssue } from "./fallback-issue.js";
 
 export type AutoLevel = "low" | "medium" | "high";
 export type CatalogSource = "fallback" | "account" | "cache";
+/** agent = Droid owns tools (legacy). pi-tools = bridge Pi tools via MCP. */
+export type DroidMode = "agent" | "pi-tools";
 
 export interface ModelOverride {
   name?: string;
@@ -28,6 +30,12 @@ export interface ConfigFile {
   /** Forward the host's AGENTS.md + skills catalog into Droid sessions
    *  (default true). Disable to keep Droid fully context-blind. */
   forwardContext?: boolean;
+  /**
+   * agent (default): Droid runs its own tool loop.
+   * pi-tools: disable native tools and bridge Pi tools through SDK MCP so
+   * execution happens in Pi (claude-bridge style). Still not a raw LLM API.
+   */
+  mode?: DroidMode;
   models?: Record<string, ModelOverride>;
 }
 
@@ -37,6 +45,7 @@ export interface ResolvedConfig {
   defaultModel: string;
   strictModelMatch: boolean;
   forwardContext: boolean;
+  mode: DroidMode;
   modelOverrides: Record<string, ModelOverride>;
   loadedFrom?: string;
 }

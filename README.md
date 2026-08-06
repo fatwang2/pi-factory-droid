@@ -8,21 +8,43 @@ Pi's built-in provider list does not include Factory Droid. This extension regis
 
 ## Harness ownership
 
-This is an agent-to-agent bridge, not a raw model provider:
+This is an agent-to-agent bridge, not a raw model provider. Two modes:
+
+### `mode: "agent"` (default)
 
 - **Pi owns:** terminal UI, provider/model selection, outer session log, cancellation, and rendering.
 - **Factory Droid owns:** its system prompt, internal conversation, tools, permission protocol, file edits, commands, and tool loop.
 
-Pi's built-in tool definitions are never forwarded. **Host context IS forwarded
-by default** (`forwardContext`, disable via config or
+Pi's built-in tool definitions are never forwarded.
+
+### `mode: "pi-tools"` (experimental hybrid)
+
+Inspired by `pi-claude-bridge`:
+
+- **Droid owns:** cloud session, subscription billing, system prompt, compaction.
+- **Pi owns:** tool execution (bash/read/edit/…) via an SDK MCP bridge.
+- Native Droid tools are disabled after `listTools()` ( **ToolSearch** may remain — Factory will not fully disable it).
+- When Droid calls a `pi-tools` MCP tool, the MCP handler suspends until Pi runs the tool and the next `streamSimple` delivers `toolResult`s.
+
+This is still **not** a pure Pi harness / raw LLM API (unlike `pi-antigravity`). Enable with:
+
+```json
+// ~/.pi/agent/droid.json
+{ "mode": "pi-tools" }
+```
+
+or `PI_DROID_MODE=pi-tools`.
+
+**Host context IS forwarded by default** (`forwardContext`, disable via config or
 `PI_DROID_FORWARD_CONTEXT=0`): the working directory's `AGENTS.md`
 (persona/long-term memory) and the same skills catalog Pi would inject
 (`~/.pi/agent/skills`, `<cwd>/.pi/skills`, and the `.agents/skills` tiers from
 cwd up to the git root plus `~/.agents/skills`, closest-wins) ride into the
 Droid session as a user-level preamble on its first turn. Skills are plain
-files, so Droid reads the referenced `SKILL.md` with its own tools. When the
-forwarded context changes (persona edited, memory consolidated, skills added),
-the session is transparently recreated so the new context takes effect.
+files, so Droid reads the referenced `SKILL.md` with its own tools (agent mode)
+or via Pi tools (pi-tools mode). When the forwarded context changes (persona
+edited, memory consolidated, skills added), the session is transparently
+recreated so the new context takes effect.
 
 ## Session pooling
 
@@ -98,10 +120,12 @@ Optional `~/.pi/agent/droid.json`:
   "autoLevel": "low",
   "defaultModel": "auto",
   "strictModelMatch": true,
+  "mode": "agent",
   "models": {}
 }
 ```
 
+- `mode` (`agent` | `pi-tools`): harness strategy. Default `agent`. `pi-tools` bridges Pi tools through MCP (see above). Env: `PI_DROID_MODE`.
 - `autoLevel` (`low` | `medium` | `high`): maps to Droid's `ProceedAutoRunLow/Medium/High` so high autonomy means no permission prompts. Override with `PI_DROID_PROMPT_ALWAYS=1` to force Pi UI confirmation on every action.
 - `strictModelMatch`: rejects silent model substitution when Droid resolves `auto` to a different model id.
 - `models`: per-model overrides (`name`, `reasoning`, `contextWindow`, `maxTokens`, `cost`, `thinkingLevelMap`, `input`).

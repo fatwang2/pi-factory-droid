@@ -15,6 +15,7 @@ function makeCfg(forwardContext: boolean): ResolvedConfig {
     defaultModel: "auto",
     strictModelMatch: true,
     forwardContext,
+    mode: "agent",
     modelOverrides: {},
   };
 }

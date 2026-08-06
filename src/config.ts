@@ -1,11 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AutoLevel, ConfigFile, ModelOverride, ResolvedConfig } from "./types.js";
+import type { AutoLevel, ConfigFile, DroidMode, ModelOverride, ResolvedConfig } from "./types.js";
 
 const DEFAULT_DROID_BINARY = "droid";
 const DEFAULT_AUTO_LEVEL: AutoLevel = "low";
 const DEFAULT_MODEL = "auto";
+const DEFAULT_MODE: DroidMode = "agent";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "droid.json");
 
 export function loadConfig(): ResolvedConfig {
@@ -14,6 +15,7 @@ export function loadConfig(): ResolvedConfig {
   const envAutoLevel = coerceAutoLevel(process.env.DROID_AUTO_LEVEL?.trim());
 
   const envForward = coerceBooleanEnv(process.env.PI_DROID_FORWARD_CONTEXT);
+  const envMode = coerceMode(process.env.PI_DROID_MODE?.trim());
 
   return {
     droidBinary: envBinary || fromFile.parsed.droidBinary?.trim() || DEFAULT_DROID_BINARY,
@@ -21,6 +23,7 @@ export function loadConfig(): ResolvedConfig {
     defaultModel: fromFile.parsed.defaultModel?.trim() || DEFAULT_MODEL,
     strictModelMatch: fromFile.parsed.strictModelMatch ?? true,
     forwardContext: envForward ?? fromFile.parsed.forwardContext ?? true,
+    mode: envMode ?? coerceMode(fromFile.parsed.mode) ?? DEFAULT_MODE,
     modelOverrides: normalizeModelOverrides(fromFile.parsed.models),
     loadedFrom: fromFile.exists ? CONFIG_PATH : undefined,
   };
@@ -56,12 +59,19 @@ function coerceConfigFile(value: unknown, path: string): ConfigFile {
   if (auto) out.autoLevel = auto;
   if (typeof value.defaultModel === "string") out.defaultModel = value.defaultModel;
   if (typeof value.strictModelMatch === "boolean") out.strictModelMatch = value.strictModelMatch;
+  if (typeof value.forwardContext === "boolean") out.forwardContext = value.forwardContext;
+  const mode = coerceMode(value.mode);
+  if (mode) out.mode = mode;
   if (isPlainObject(value.models)) out.models = value.models as Record<string, ModelOverride>;
   return out;
 }
 
 function coerceAutoLevel(value: unknown): AutoLevel | undefined {
   return value === "low" || value === "medium" || value === "high" ? value : undefined;
+}
+
+function coerceMode(value: unknown): DroidMode | undefined {
+  return value === "agent" || value === "pi-tools" ? value : undefined;
 }
 
 function normalizeModelOverrides(raw: Record<string, ModelOverride> | undefined): Record<string, ModelOverride> {
