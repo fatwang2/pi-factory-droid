@@ -120,9 +120,16 @@ function readPiStoredFactoryKey() {
   if (!existsSync(PI_AUTH_PATH)) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(PI_AUTH_PATH, "utf8"));
-    const factory = parsed?.providers?.factory ?? parsed?.factory;
-    const key = factory?.apiKey ?? factory?.key;
-    return typeof key === "string" ? key.trim() : undefined;
+    const roots = [parsed?.providers, parsed];
+    // `droid` is this extension's provider id in pi; `factory` covers older stores.
+    for (const root of roots) {
+      for (const name of ["droid", "factory"]) {
+        const entry = root?.[name];
+        const key = entry?.apiKey ?? entry?.key;
+        if (typeof key === "string" && key.trim()) return key.trim();
+      }
+    }
+    return undefined;
   } catch {
     return undefined;
   }
