@@ -284,7 +284,7 @@ export function registerProvider(
     models: state.lastModels.map((model) => model.piModel),
     streamSimple: (model, context, options) => streamDroid(model, context, options, state.cfg, runtime),
     refreshModels: async (context) => {
-      const cached = await context.store.read();
+      const cached = context.stored;
       if (cached?.models?.length) {
         const restored = fromStoredModels(cached.models, state.cfg.modelOverrides);
         if (restored.length) {
@@ -314,7 +314,9 @@ export function registerProvider(
         state.catalogSource = "account";
         state.catalogUpdatedAt = Date.now();
         state.catalogIssue = undefined;
-        await context.store.write({ models: toStoredModels(models), checkedAt: state.catalogUpdatedAt });
+        await context.publish({
+          persist: { models: toStoredModels(models), checkedAt: state.catalogUpdatedAt },
+        });
         return models.map((model) => model.piModel);
       } catch (error) {
         state.catalogIssue = discoveryFailedIssue(error);
